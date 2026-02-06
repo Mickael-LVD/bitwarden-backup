@@ -17,7 +17,7 @@ def list_remotes(_: Annotated[bool, Depends(get_token)]) -> RemotesResponse:
     remotes = run_listremotes()
     return RemotesResponse(remotes=remotes)
 
-@router.get("/{remote}/check")
+@router.get("/{remote}/check/")
 def check_remote_connection(remote: str, _: Annotated[bool, Depends(get_token)]) -> RemoteTestResponse:
     """Check if a specific remote is reachable."""
     backup_path = get_backup_path()
@@ -38,7 +38,7 @@ def check_remote_connection(remote: str, _: Annotated[bool, Depends(get_token)])
         response_time_ms=response_time_ms,
     )
 
-@router.get("/check-all")
+@router.get("/check-all/")
 def check_all_remotes(_: Annotated[bool, Depends(get_token)]) -> AllRemotesTestResponse:
     """Check the connection status of all remotes."""
     remotes = run_listremotes()
@@ -69,7 +69,7 @@ def check_all_remotes(_: Annotated[bool, Depends(get_token)]) -> AllRemotesTestR
             )
     return AllRemotesTestResponse(results=results)
 
-@router.get("/{remote}/usage")
+@router.get("/{remote}/usage/")
 def get_remote_usage(remote: str, _: Annotated[bool, Depends(get_token)]) -> RemoteUsageResponse:
     """Get usage information for a specific remote."""
     backup_path = get_backup_path()
