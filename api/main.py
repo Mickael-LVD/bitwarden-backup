@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # Create FastAPI application with modern configuration
 app = FastAPI(
     title="Bitwarden Backup API",
+    redirect_slashes=False,
     summary="Configure once, forget forever. Automated Bitwarden backups with multi-remote cloud storage support.",
     description="""
     ## Bitwarden Vault Backup Management API
