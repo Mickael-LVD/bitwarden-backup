@@ -39,7 +39,7 @@ def _job_to_status_response(job: dict[str, Any]) -> BackupJobStatusResponse:
 
 
 @router.post(
-    "/trigger",
+    "/trigger/",
     status_code=201,
     summary="Trigger a new backup job",
     description="Start a new async backup job. Returns immediately with job ID.",
@@ -94,7 +94,7 @@ def list_backup_jobs(
 
 
 @router.get(
-    "/{job_id}",
+    "/{job_id}/",
     summary="Get job status",
     description="Get detailed status of a specific backup job.",
 )
@@ -113,7 +113,7 @@ def get_job_status(
 
 
 @router.get(
-    "/{job_id}/logs",
+    "/{job_id}/logs/",
     summary="Get job logs",
     description="Get logs for a specific backup job.",
 )
@@ -140,7 +140,7 @@ def get_job_logs(
 
 
 @router.get(
-    "/{job_id}/stream",
+    "/{job_id}/stream/",
     summary="Stream job updates (SSE)",
     description="Server-Sent Events stream for real-time job updates and logs. "
     "Pass token as query parameter since EventSource doesn't support custom headers.",
@@ -219,7 +219,7 @@ async def stream_job_updates(
 
 
 @router.post(
-    "/{job_id}/cancel",
+    "/{job_id}/cancel/",
     summary="Cancel a backup job",
     description="Cancel a pending or running backup job.",
 )
