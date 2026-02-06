@@ -26,7 +26,7 @@ RUN apt-get update && apt-get upgrade -y && \
     # Install Bitwarden CLI via npm (works on all architectures)
     npm cache clean --force && \
     npm install -g semver && \
-    npm install -g @bitwarden/cli && \
+    npm install -g @bitwarden/cli@2025.12.0 && \
     # Install rclone (auto-detect architecture)
     curl https://rclone.org/install.sh | bash && \
     # Clean up apt cache and temporary files
