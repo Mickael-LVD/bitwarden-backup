@@ -9,8 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import anyio
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 from api.auth import get_token, get_token_with_decryption_permission
 from api.cache import clear_rclone_cache, get_redis_client
@@ -45,6 +47,24 @@ def is_internal_metadata_file(filename: str) -> bool:
     """Check if a filename is an internal metadata file that should be protected."""
     return filename in INTERNAL_METADATA_FILES
 
+
+def _safe_remove_file(path: str) -> None:
+    """Best-effort file cleanup helper used by response background tasks."""
+    # Attempt cleanup quietly because response delivery should not fail on cleanup errors.
+    try:
+        # Remove the temporary file path if it still exists.
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        # Swallow cleanup errors to avoid impacting response completion.
+        return
+
+
+def _safe_remove_directory(path: str) -> None:
+    """Best-effort directory cleanup helper used by response background tasks."""
+    # Attempt recursive cleanup quietly because response delivery should not fail on cleanup errors.
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def pascal_to_snake_dict(item: dict[str, Any]) -> dict[str, Any]:
     """Convert a dictionary with PascalCase keys to snake_case keys."""
     def to_snake(s: str) -> str:
@@ -54,8 +74,11 @@ def pascal_to_snake_dict(item: dict[str, Any]) -> dict[str, Any]:
     return {to_snake(k): item[k] for k in allowed_keys if k in item}
 
 
-@router.get("/")
-def list_backups( #noqa: C901,PLR0912,PLR0913
+@router.get("")
+@router.get("/", include_in_schema=False)
+# Suppress C901 (cyclomatic complexity), PLR0912 (too many branches), PLR0913 (too many arguments),
+# and PLR0917 (too many positional arguments) because FastAPI endpoint parameters represent query parameters.
+def list_backups(  # noqa: C901,PLR0912,PLR0913,PLR0917
     remote: str,
     _: Annotated[bool, Depends(get_token)],
     search: str | None = None,
@@ -136,7 +159,8 @@ def list_backups( #noqa: C901,PLR0912,PLR0913
         page_size=page_size,
     )
 
-@router.get("/download/{remote}/{filename:path}/")
+@router.get("/download/{remote}/{filename:path}")
+@router.get("/download/{remote}/{filename:path}/", include_in_schema=False)
 def download_backup(
     remote: str, filename: str, _: Annotated[bool, Depends(get_token_with_decryption_permission)],
 ) -> FileResponse:
@@ -154,9 +178,17 @@ def download_backup(
     result = run_copyto(remote, backup_path, filename, tmp_path)
     if result.returncode != 0:
         raise HTTPException(status_code=404, detail="File not found or download failed.")
-    return FileResponse(tmp_path, filename=filename, media_type="application/octet-stream")
+    # Schedule post-response cleanup so temporary download files are not left on disk.
+    cleanup_task = BackgroundTask(_safe_remove_file, tmp_path)
+    return FileResponse(
+        tmp_path,
+        filename=filename,
+        media_type="application/octet-stream",
+        background=cleanup_task,
+    )
 
-@router.get("/{remote}/{filename:path}/")
+@router.get("/{remote}/{filename:path}")
+@router.get("/{remote}/{filename:path}/", include_in_schema=False)
 def get_backup_metadata(remote: str, filename: str, _: Annotated[bool, Depends(get_token)]) -> BackupMetadataResponse:
     """Get metadata for a specific backup file."""
     # Reject requests for internal metadata files
@@ -190,7 +222,8 @@ def get_backup_metadata(remote: str, filename: str, _: Annotated[bool, Depends(g
             return BackupMetadataResponse(**pascal_to_snake_dict(f))
     raise HTTPException(status_code=404, detail="Backup not found.")
 
-@router.delete("/{remote}/{filename:path}/")
+@router.delete("/{remote}/{filename:path}")
+@router.delete("/{remote}/{filename:path}/", include_in_schema=False)
 def delete_backup(remote: str, filename: str, _: Annotated[bool, Depends(get_token)]) -> dict[str, str]:
     """Delete a specific backup file from a remote."""
     # Prevent deletion of internal metadata files
@@ -208,9 +241,10 @@ def delete_backup(remote: str, filename: str, _: Annotated[bool, Depends(get_tok
         redis_client.delete(cache_key)
         return {"status": "ok", "message": f"Deleted {filename}"}
     raise HTTPException(status_code=500,
-                        detail=f"Failed to delete backup: {result.stderr if result.stderr else 'Delete failed'}")
+                        detail=f"Failed to delete backup: {result.stderr or 'Delete failed'}")
 
-@router.post("/restore/{remote}/{filename:path}/")
+@router.post("/restore/{remote}/{filename:path}")
+@router.post("/restore/{remote}/{filename:path}/", include_in_schema=False)
 async def restore_backup(
     remote: str,
     filename: str,
@@ -241,7 +275,8 @@ async def restore_backup(
     scripts_dir = get_scripts_dir()
     script_path = scripts_dir / "restore-backup.sh"
 
-    if not script_path.exists():
+    # Use anyio.Path to avoid ASYNC240 (blocking pathlib.Path I/O in async func)
+    if not await anyio.Path(script_path).exists():
         raise HTTPException(status_code=500, detail="Restore script not found.")
 
     # Create a temporary directory securely, then create file inside it
@@ -272,17 +307,22 @@ async def restore_backup(
             error_message = stderr.decode() if stderr else "Unknown error occurred"
             _raise_process_error(error_message)
 
-        if not output_file.exists():
+        # Use anyio.Path to avoid ASYNC240 (blocking pathlib.Path I/O in async func)
+        if not await anyio.Path(output_file).exists():
             _raise_output_missing_error()
 
+        # Schedule post-response cleanup so restored plaintext files are not left on disk.
+        cleanup_task = BackgroundTask(_safe_remove_directory, temp_dir)
         return FileResponse(
             path=str(output_file),
             filename=f"restored_{filename.replace('.enc', '.json')}",
             media_type="application/json",
+            background=cleanup_task,
         )
     except Exception as e:
         # Clean up the temporary directory on error
-        if Path(temp_dir).exists():
+        # Use anyio.Path to avoid ASYNC240 (blocking pathlib.Path I/O in async func)
+        if await anyio.Path(temp_dir).exists():
             shutil.rmtree(temp_dir)
         if isinstance(e, HTTPException):
             raise
@@ -291,7 +331,8 @@ async def restore_backup(
             detail=f"An unexpected error occurred during restore: {e!s}",
         ) from e
 
-@router.post("/refresh-cache/")
+@router.post("/refresh-cache")
+@router.post("/refresh-cache/", include_in_schema=False)
 def refresh_cache(remote: str, _: Annotated[bool, Depends(get_token)]) -> CacheRefreshResponse:
     """Refresh the cache for the rclone lsjson command."""
     backup_path = get_backup_path()
@@ -309,7 +350,7 @@ def refresh_cache(remote: str, _: Annotated[bool, Depends(get_token)]) -> CacheR
         raise HTTPException(status_code=500, detail=f"Failed to refresh cache - {e}.") from e
 
 @router.post(
-    "/trigger-backup/",
+    "/trigger-backup",
     deprecated=True,
     summary="Trigger backup (DEPRECATED - use /api/v1/jobs/trigger instead)",
     description="""
@@ -334,7 +375,8 @@ def trigger_backup(_: Annotated[bool, Depends(get_token)]) -> TriggerBackupRespo
         backup_id=None,
     )
 
-@router.post("/{remote}/bulk-delete/")
+@router.post("/{remote}/bulk-delete")
+@router.post("/{remote}/bulk-delete/", include_in_schema=False)
 def bulk_delete_backups(
     remote: str,
     req: BulkDeleteRequest,
@@ -365,7 +407,7 @@ def bulk_delete_backups(
             message = f"Deleted {filename}"
         else:
             status = "error"
-            message = result.stderr if result.stderr else "Delete failed"
+            message = result.stderr or "Delete failed"
         results.append(
             BulkDeleteResult(
                 filename=filename,
@@ -381,7 +423,8 @@ def bulk_delete_backups(
         total_size_freed=0,
     )
 
-@router.post("/rclone/config/base64/")
+@router.post("/rclone/config/base64")
+@router.post("/rclone/config/base64/", include_in_schema=False)
 def rclone_config_to_base64(
     _: Annotated[bool, Depends(get_token)],
     config: Annotated[str, Body(media_type="text/plain", description="Raw rclone config contents")],

@@ -97,6 +97,7 @@ TIMESTAMP=$(date "+%Y%m%d%H%M%S")
 COMPRESSED_FILE="" # Will be set during secure pipe-based export
 export NODE_NO_DEPRECATION=1 # Suppress Node.js deprecation warnings from bw CLI
 changes_detected=false # Make this global so the trap can access it
+RAW_DATA_HASH="" # Will hold a stable hash of canonical plaintext export JSON for change detection
 
 # Global arrays to track remote success/failure for final notification
 declare -a SUCCESSFUL_REMOTES=()
@@ -113,6 +114,8 @@ readonly MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
 readonly EXPORT_PERSONAL="${EXPORT_PERSONAL:-true}"
 readonly EXPORT_ORGANIZATIONS="${EXPORT_ORGANIZATIONS:-false}"
 readonly BW_ORGANIZATION_IDS="${BW_ORGANIZATION_IDS:-}"
+# Control whether a single organization export failure should abort the entire run.
+readonly EXPORT_ORGANIZATIONS_FAIL_FAST="${EXPORT_ORGANIZATIONS_FAIL_FAST:-false}"
 
 # --- Logging Function ---
 log() {
@@ -838,19 +841,26 @@ configure_bitwarden_server() {
     elif [ -n "${BW_WEB_VAULT:-}" ] || [ -n "${BW_API:-}" ] || [ -n "${BW_IDENTITY:-}" ] || [ -n "${BW_ICONS:-}" ] || [ -n "${BW_NOTIFICATIONS:-}" ] || [ -n "${BW_EVENTS:-}" ] || [ -n "${BW_KEY_CONNECTOR:-}" ]; then
         log INFO "Configuring individual Bitwarden service URLs..."
 
-        # Build the config command with individual service URLs
-        local config_cmd="bw config server"
+        # Build the config command as an argument array to avoid eval and shell injection risk.
+        local -a config_cmd=("bw" "config" "server")
 
-        [ -n "${BW_WEB_VAULT:-}" ] && config_cmd+=" --web-vault \"$BW_WEB_VAULT\""
-        [ -n "${BW_API:-}" ] && config_cmd+=" --api \"$BW_API\""
-        [ -n "${BW_IDENTITY:-}" ] && config_cmd+=" --identity \"$BW_IDENTITY\""
-        [ -n "${BW_ICONS:-}" ] && config_cmd+=" --icons \"$BW_ICONS\""
-        [ -n "${BW_NOTIFICATIONS:-}" ] && config_cmd+=" --notifications \"$BW_NOTIFICATIONS\""
-        [ -n "${BW_EVENTS:-}" ] && config_cmd+=" --events \"$BW_EVENTS\""
-        [ -n "${BW_KEY_CONNECTOR:-}" ] && config_cmd+=" --key-connector \"$BW_KEY_CONNECTOR\""
+        # Add optional web vault URL when provided.
+        [ -n "${BW_WEB_VAULT:-}" ] && config_cmd+=("--web-vault" "$BW_WEB_VAULT")
+        # Add optional API URL when provided.
+        [ -n "${BW_API:-}" ] && config_cmd+=("--api" "$BW_API")
+        # Add optional identity URL when provided.
+        [ -n "${BW_IDENTITY:-}" ] && config_cmd+=("--identity" "$BW_IDENTITY")
+        # Add optional icons URL when provided.
+        [ -n "${BW_ICONS:-}" ] && config_cmd+=("--icons" "$BW_ICONS")
+        # Add optional notifications URL when provided.
+        [ -n "${BW_NOTIFICATIONS:-}" ] && config_cmd+=("--notifications" "$BW_NOTIFICATIONS")
+        # Add optional events URL when provided.
+        [ -n "${BW_EVENTS:-}" ] && config_cmd+=("--events" "$BW_EVENTS")
+        # Add optional key connector URL when provided.
+        [ -n "${BW_KEY_CONNECTOR:-}" ] && config_cmd+=("--key-connector" "$BW_KEY_CONNECTOR")
 
-        log INFO "Executing: $config_cmd"
-        if ! eval "$config_cmd" >/dev/null 2>&1; then
+        # Execute configured command arguments directly without shell interpolation.
+        if ! "${config_cmd[@]}" >/dev/null 2>&1; then
             log ERROR "Failed to configure individual Bitwarden service URLs"
             exit "$EXIT_LOGIN_FAILED"
         fi
@@ -955,10 +965,65 @@ export_data() {
         exit "$EXIT_EXPORT_FAILED"
     fi
 
-    # Determine if we need consolidated format (when organizations are exported)
+    # Track whether the final backup payload should use the consolidated structure.
     local use_consolidated_format=false
-    if [[ "$EXPORT_ORGANIZATIONS" == "true" && -n "$BW_ORGANIZATION_IDS" ]]; then
-        use_consolidated_format=true
+    # Track the final list of organization IDs to export after normalization/discovery.
+    local effective_org_ids="${BW_ORGANIZATION_IDS}"
+
+    # Resolve organization IDs early so later export logic can stay simple and deterministic.
+    if [[ "$EXPORT_ORGANIZATIONS" == "true" ]]; then
+        # Normalize user-provided IDs by removing whitespace around comma-separated values.
+        effective_org_ids=$(echo "$effective_org_ids" | tr -d '[:space:]')
+
+        # Prefer explicit IDs when the user has provided them.
+        if [ -n "$effective_org_ids" ]; then
+            # Log the source of organization IDs for observability during troubleshooting.
+            log INFO "Using organization IDs from BW_ORGANIZATION_IDS."
+        else
+            # Announce automatic discovery so users understand why `bw list organizations` is executed.
+            log INFO "BW_ORGANIZATION_IDS is empty. Discovering all accessible organizations automatically..."
+
+            # Store the full JSON response from Bitwarden so we can validate and parse it safely.
+            local organizations_json
+            # Query Bitwarden for all organizations visible to the authenticated account.
+            if ! organizations_json=$(bw list organizations --session "$BW_SESSION" 2>/dev/null); then
+                # Fail fast because organization exports were explicitly requested.
+                log ERROR "Failed to list organizations for automatic export discovery."
+                exit "$EXIT_EXPORT_FAILED"
+            fi
+
+            # Validate the response is well-formed JSON before trying to parse organization IDs.
+            if ! echo "$organizations_json" | jq empty >/dev/null 2>&1; then
+                # Stop here to avoid silently skipping org backups due to malformed output.
+                log ERROR "Bitwarden returned invalid JSON while listing organizations."
+                exit "$EXIT_EXPORT_FAILED"
+            fi
+
+            # Extract organization IDs and convert them into a comma-separated list for reuse by existing logic.
+            if ! effective_org_ids=$(echo "$organizations_json" | jq -r '[.[] | .id // empty | select(length > 0)] | join(",")'); then
+                # Stop if parsing fails so we do not run with ambiguous or partial organization state.
+                log ERROR "Failed to parse organization IDs from Bitwarden response."
+                exit "$EXIT_EXPORT_FAILED"
+            fi
+
+            # Report discovery results so users can confirm automatic org detection behavior.
+            if [ -n "$effective_org_ids" ]; then
+                # Split the normalized list only to calculate and log a clear organization count.
+                local -a discovered_org_ids=()
+                IFS=',' read -ra discovered_org_ids <<< "$effective_org_ids"
+                # Log exactly how many organizations will be exported.
+                log SUCCESS "Auto-discovered ${#discovered_org_ids[@]} organization(s) for export."
+            else
+                # Warn when no organizations are available for the current account/session.
+                log WARN "No accessible organizations found for this account. Skipping organization export."
+            fi
+        fi
+
+        # Enable consolidated backup format whenever at least one organization ID is available.
+        if [ -n "$effective_org_ids" ]; then
+            # Consolidated format is required to preserve personal + organization separation in one file.
+            use_consolidated_format=true
+        fi
     fi
 
     local final_data=""
@@ -987,13 +1052,16 @@ export_data() {
     # Export organization vaults if requested
     local org_exports=""
     if [[ "$EXPORT_ORGANIZATIONS" == "true" ]]; then
-        if [ -z "$BW_ORGANIZATION_IDS" ]; then
-            log WARN "EXPORT_ORGANIZATIONS is enabled but BW_ORGANIZATION_IDS is empty."
-            log INFO "To get organization IDs, run: bw list organizations --session \$BW_SESSION"
-            # If personal export is also disabled, this is an error
+        # If no IDs are resolved, we cannot run organization exports.
+        if [ -z "$effective_org_ids" ]; then
+            # Surface why org exports are skipped to avoid silent surprises.
+            log WARN "EXPORT_ORGANIZATIONS is enabled but no organization IDs were resolved."
+            # If personal export is disabled, this configuration would produce an empty backup.
             if [[ "$EXPORT_PERSONAL" != "true" ]]; then
-                log ERROR "Cannot export organizations without BW_ORGANIZATION_IDS and personal export is disabled."
-                log ERROR "Either set BW_ORGANIZATION_IDS or enable EXPORT_PERSONAL=true"
+                # Fail clearly because no export source remains.
+                log ERROR "Cannot export organizations because no organization IDs were resolved and personal export is disabled."
+                # Suggest the two valid recovery paths for this configuration.
+                log ERROR "Either set BW_ORGANIZATION_IDS, ensure account access to at least one organization, or enable EXPORT_PERSONAL=true"
                 exit "$EXIT_EXPORT_FAILED"
             fi
         else
@@ -1001,11 +1069,18 @@ export_data() {
 
             # Initialize organizations object
             org_exports='{}'
+            # Track successful organization exports for post-loop validation and reporting.
+            local org_export_success_count=0
+            # Track failed organization exports for post-loop validation and reporting.
+            local org_export_failure_count=0
+            # Track organization IDs that failed export for actionable troubleshooting output.
+            local -a failed_org_ids=()
 
-            # Split organization IDs by comma
-            IFS=',' read -ra ORG_IDS <<< "$BW_ORGANIZATION_IDS"
+            # Split organization IDs by comma so each organization can be exported independently.
+            local -a org_ids=()
+            IFS=',' read -ra org_ids <<< "$effective_org_ids"
 
-            for org_id in "${ORG_IDS[@]}"; do
+            for org_id in "${org_ids[@]}"; do
                 # Trim whitespace
                 org_id=$(echo "$org_id" | tr -d '[:space:]')
 
@@ -1014,8 +1089,19 @@ export_data() {
 
                     local org_export
                     if ! org_export=$(echo "$BW_PASSWORD" | bw export --raw --session "$BW_SESSION" --format json --organizationid "$org_id" 2>/dev/null); then
-                        log ERROR "Failed to export organization $org_id."
-                        exit "$EXIT_EXPORT_FAILED"
+                        # Record failed export so script can either continue or fail based on configured mode.
+                        org_export_failure_count=$((org_export_failure_count + 1))
+                        # Append organization ID to failure list for summary logging.
+                        failed_org_ids+=("$org_id")
+                        # Fail immediately only when strict fail-fast mode is explicitly enabled.
+                        if [[ "$EXPORT_ORGANIZATIONS_FAIL_FAST" == "true" ]]; then
+                            # Stop backup process early because fail-fast mode requires strict success.
+                            log ERROR "Failed to export organization $org_id (fail-fast mode enabled)."
+                            exit "$EXIT_EXPORT_FAILED"
+                        fi
+                        # Continue with other organizations so one permission issue does not block all backups.
+                        log WARN "Failed to export organization $org_id. Continuing with remaining organizations."
+                        continue
                     fi
 
                     # Validate organization export (allow empty organizations)
@@ -1036,12 +1122,43 @@ export_data() {
                         rm -f "$temp_org_export" "$temp_org_current" 2>/dev/null || true
 
                         export_count=$((export_count + 1))
+                        org_export_success_count=$((org_export_success_count + 1))
                         log SUCCESS "Organization $org_id exported successfully"
                     else
+                        # Record invalid/empty exports as failures for consistent summary reporting.
+                        org_export_failure_count=$((org_export_failure_count + 1))
+                        # Append organization ID to failure list for summary logging.
+                        failed_org_ids+=("$org_id")
+                        # Fail immediately only when strict fail-fast mode is explicitly enabled.
+                        if [[ "$EXPORT_ORGANIZATIONS_FAIL_FAST" == "true" ]]; then
+                            # Stop backup process early because fail-fast mode requires strict success.
+                            log ERROR "Organization $org_id export is empty or invalid (fail-fast mode enabled)."
+                            exit "$EXIT_EXPORT_FAILED"
+                        fi
+                        # Keep warning behavior in tolerant mode so remaining organizations can still export.
                         log WARN "Organization $org_id export is empty or invalid (organization may be empty)"
                     fi
                 fi
             done
+
+            # Report organization export failures after processing all IDs in tolerant mode.
+            if [ "$org_export_failure_count" -gt 0 ]; then
+                # Include failed IDs so users can verify permissions and organization policy constraints.
+                log WARN "Organization export failures: $org_export_failure_count (IDs: ${failed_org_ids[*]})"
+            fi
+
+            # Validate that at least one organization export succeeded when org export was requested.
+            if [ "$org_export_success_count" -eq 0 ]; then
+                # If personal export is disabled, a full failure would produce no backup data.
+                if [[ "$EXPORT_PERSONAL" != "true" ]]; then
+                    # Fail clearly because neither personal nor organization exports produced data.
+                    log ERROR "No organization exports succeeded and personal export is disabled."
+                    log ERROR "Ensure your account has organization export permission or disable fail-fast mode for partial success."
+                    exit "$EXIT_EXPORT_FAILED"
+                fi
+                # Keep run successful when personal export is enabled, while surfacing the org-only failure.
+                log WARN "No organization exports succeeded; proceeding with personal vault data only."
+            fi
         fi
     fi
 
@@ -1108,9 +1225,23 @@ export_data() {
         exit "$EXIT_COMPRESS_FAILED"
     fi
 
-    # Secure pipe: final JSON -> gzip -> openssl encrypt -> file
-    # This ensures unencrypted data never touches the disk
-    if ! echo "$final_data" | jq -c '.' | \
+    # Canonicalize the JSON once so encryption and hash comparison use identical payload representation.
+    local canonical_final_data=""
+    if ! canonical_final_data=$(printf "%s" "$final_data" | jq -c '.'); then
+        log ERROR "Failed to canonicalize export JSON before encryption."
+        exit "$EXIT_EXPORT_FAILED"
+    fi
+
+    # Compute a stable plaintext hash for reliable change detection across runs.
+    if ! RAW_DATA_HASH=$(printf "%s" "$canonical_final_data" | calculate_sha256_stdin); then
+        log ERROR "Failed to compute canonical plaintext hash for change detection."
+        exit "$EXIT_EXPORT_FAILED"
+    fi
+    log DEBUG "Canonical plaintext export hash computed successfully."
+
+    # Secure pipe: canonical JSON -> gzip -> openssl encrypt -> file.
+    # This ensures unencrypted data never touches the disk.
+    if ! printf "%s" "$canonical_final_data" | \
          gzip -c -"${COMPRESSION_LEVEL}" | \
          openssl enc -aes-256-cbc -pbkdf2 -iter "$PBKDF2_ITERATIONS" -salt -pass env:ENCRYPTION_PASSWORD > "$temp_encrypted_file"; then
         log ERROR "Failed to create secure encrypted backup."
@@ -1185,32 +1316,20 @@ validate_export() {
     log SUCCESS "Encrypted backup file validation passed - can be decrypted and contains valid JSON."
 }
 
-
-# Cross-platform SHA256 calculation
-calculate_sha256() {
-    local filepath="$1"
+# Calculate SHA256 hash from stdin content
+calculate_sha256_stdin() {
     if command -v sha256sum >/dev/null 2>&1; then
-        # Linux/GNU coreutils
-        sha256sum "$filepath" | awk '{print $1}'
+        # Linux/GNU coreutils path for stdin hashing
+        sha256sum | awk '{print $1}'
     elif command -v shasum >/dev/null 2>&1; then
-        # macOS/BSD systems
-        shasum -a 256 "$filepath" | awk '{print $1}'
+        # macOS/BSD systems path for stdin hashing
+        shasum -a 256 | awk '{print $1}'
     elif command -v openssl >/dev/null 2>&1; then
-        # Fallback to OpenSSL (available on most systems)
-        openssl dgst -sha256 "$filepath" | awk '{print $NF}'
+        # OpenSSL fallback path for stdin hashing
+        openssl dgst -sha256 | awk '{print $NF}'
     else
-        log ERROR "No SHA256 utility found (tried sha256sum, shasum, openssl)"
-        exit "$EXIT_MISSING_DEP"
-    fi
-}
-
-# Calculate SHA256 hash of a file
-get_local_file_hash() {
-    local filepath="$1"
-    if [ -f "$filepath" ]; then
-        calculate_sha256 "$filepath"
-    else
-        echo "" # Return empty string if file doesn't exist locally
+        log ERROR "No SHA256 utility found for stdin hashing (tried sha256sum, shasum, openssl)"
+        return 1
     fi
 }
 
@@ -1358,21 +1477,13 @@ main() {
     export_data
     validate_export
 
-    # Calculate hash of the encrypted backup
-    local current_backup_hash
-    # Temporarily disable strict mode for command substitution to prevent silent exit
-    set +e
-    current_backup_hash=$(get_local_file_hash "$COMPRESSED_FILE")
-    local hash_exit_code=$?
-    set -e
-
-    if [ $hash_exit_code -ne 0 ] || [ -z "$current_backup_hash" ]; then
-        log ERROR "Failed to calculate hash of encrypted backup file: $COMPRESSED_FILE"
-        log ERROR "Hash calculation exit code: $hash_exit_code"
-        log ERROR "Ensure the file exists and SHA256 utilities are available."
+    # Use canonical plaintext hash computed during export for stable cross-run change detection.
+    local current_backup_hash="$RAW_DATA_HASH"
+    if [ -z "$current_backup_hash" ]; then
+        log ERROR "Canonical plaintext hash is missing. Export step did not produce a valid hash."
         exit "$EXIT_INVALID_BACKUP"
     fi
-    log DEBUG "Current encrypted backup hash: $current_backup_hash"
+    log DEBUG "Current canonical plaintext backup hash: $current_backup_hash"
 
     # Get available remotes
     local available_remotes
